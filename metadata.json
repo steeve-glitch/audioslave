@@ -1,0 +1,5 @@
+{
+  "name": "Batch Audio Transcriber",
+  "description": "An application to upload multiple audio or video files (.mp3, .mp4) and receive text transcriptions for each using the Google Gemini API.",
+  "requestFramePermissions": []
+}
