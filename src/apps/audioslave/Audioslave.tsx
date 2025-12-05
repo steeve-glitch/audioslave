@@ -38,6 +38,23 @@ const handleApiError = (error: unknown): string => {
     return errorMessage;
 }
 
+// --- Helper to convert JSON segments to SRT format ---
+const jsonToSrt = (segments: { start: string; end: string; text: string }[]): string => {
+    return segments.map((segment, index) => {
+        return `${index + 1}\n${segment.start} --> ${segment.end}\n${segment.text.trim()}`;
+    }).join('\n\n');
+};
+
+// --- Helper to strip SRT tags for plain text ---
+const stripSrt = (srt: string): string => {
+    // Remove timestamp lines (e.g., 00:00:01,000 --> 00:00:04,000)
+    let text = srt.replace(/^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}.*$/gm, '');
+    // Remove sequence numbers (digits on their own line)
+    text = text.replace(/^\d+$/gm, '');
+    // Remove empty lines and trim
+    return text.split('\n').filter(line => line.trim() !== '').join('\n');
+};
+
 const transcribeAudio = async (worker: Worker, ai: GoogleGenAI, file: File, enableDiarization: boolean): Promise<TranscriptionResult> => {
     try {
         const model = "gemini-2.0-flash-exp";
@@ -57,19 +74,43 @@ const transcribeAudio = async (worker: Worker, ai: GoogleGenAI, file: File, enab
             inlineData: { data: base64Data, mimeType },
         };
 
+        const schema = {
+            type: "ARRAY",
+            items: {
+                type: "OBJECT",
+                properties: {
+                    start: { type: "STRING", description: "Start timestamp in SRT format (HH:MM:SS,mmm)" },
+                    end: { type: "STRING", description: "End timestamp in SRT format (HH:MM:SS,mmm)" },
+                    text: { type: "STRING", description: "The subtitle text content" },
+                },
+                required: ["start", "end", "text"],
+            },
+        };
+
         const textPrompt = enableDiarization
-            ? "Transcribe this audio. Enable speaker diarization and label each speaker (e.g., [Speaker 1], [Speaker 2])."
-            : "Transcribe this audio file.";
+            ? "Transcribe this audio. Return a JSON array of subtitle segments. Each segment must have 'start', 'end' (in HH:MM:SS,mmm format), and 'text' fields. Enable speaker diarization and include speaker labels (e.g., [Speaker 1]) in the 'text' field. Keep segments short (max 2 lines, ~40 chars/line) for better readability."
+            : "Transcribe this audio. Return a JSON array of subtitle segments. Each segment must have 'start', 'end' (in HH:MM:SS,mmm format), and 'text' fields. Keep segments short (max 2 lines, ~40 chars/line) for better readability.";
 
         const response = await ai.models.generateContent({
             model,
             contents: { parts: [audioPart, { text: textPrompt }] },
-        });
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: schema,
+            }
+        } as any);
 
-        const transcript = response.text;
+        const jsonText = response.text;
 
-        if (transcript) {
-            return { success: true, transcript };
+        if (jsonText) {
+            try {
+                const segments = JSON.parse(jsonText);
+                const srtTranscript = jsonToSrt(segments);
+                return { success: true, transcript: srtTranscript };
+            } catch (parseError) {
+                console.error("JSON Parse Error:", parseError);
+                return { success: false, error: "Failed to parse transcription response." };
+            }
         } else {
             return { success: false, error: "Transcription failed. The audio might be silent or could not be processed." };
         }
@@ -206,7 +247,7 @@ const Audioslave: React.FC = () => {
 
     const handleDownloadTxt = () => {
         const content = completedFiles
-            .map(qf => `--- TRANSCRIPT FOR: ${qf.file.name} ---\n\n${qf.transcript}\n\n`)
+            .map(qf => `--- TRANSCRIPT FOR: ${qf.file.name} ---\n\n${stripSrt(qf.transcript || '')}\n\n`)
             .join('\n');
         const blob = new Blob([content], { type: 'text/plain' });
         const url = URL.createObjectURL(blob);
@@ -223,7 +264,10 @@ const Audioslave: React.FC = () => {
         const zip = new JSZip();
         completedFiles.forEach(qf => {
             const fileName = qf.file.name.split('.').slice(0, -1).join('.') + '.txt';
-            zip.file(fileName, qf.transcript || '');
+            zip.file(fileName, stripSrt(qf.transcript || ''));
+            // Also add the SRT file to the zip for convenience
+            const srtName = qf.file.name.split('.').slice(0, -1).join('.') + '.srt';
+            zip.file(srtName, qf.transcript || '');
         });
         const content = await zip.generateAsync({ type: 'blob' });
         const url = URL.createObjectURL(content);
@@ -237,16 +281,10 @@ const Audioslave: React.FC = () => {
     };
 
     const handleDownloadSrt = () => {
-        let srtContent = '';
-        let subtitleIndex = 1;
-        completedFiles.forEach(qf => {
-            const lines = qf.transcript?.split('\n').filter(line => line.trim() !== '');
-            lines?.forEach((line, index) => {
-                const startTime = new Date(index * 5000).toISOString().substr(11, 12).replace('.', ',');
-                const endTime = new Date((index * 5000) + 4000).toISOString().substr(11, 12).replace('.', ',');
-                srtContent += `${subtitleIndex++}\n${startTime} --> ${endTime}\n${line}\n\n`;
-            });
-        });
+        // Since the transcript is now natively in SRT format, we just concatenate them
+        const srtContent = completedFiles
+            .map(qf => qf.transcript)
+            .join('\n\n');
 
         const blob = new Blob([srtContent], { type: 'text/srt' });
         const url = URL.createObjectURL(blob);
