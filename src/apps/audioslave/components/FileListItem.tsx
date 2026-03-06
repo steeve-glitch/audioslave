@@ -26,8 +26,8 @@ const StatusIndicator: React.FC<{ status: TranscriptionStatus; statusDetail?: st
     const config = STATUS_CONFIG[status] || STATUS_CONFIG[TranscriptionStatus.ERROR];
     let label = config.text;
     if (status === TranscriptionStatus.TRANSCRIBING && statusDetail) {
-        label = (statusDetail === 'Uploading...' && uploadProgress !== undefined)
-            ? `Uploading ${uploadProgress}%`
+        label = (statusDetail.includes('Uploading') && uploadProgress !== undefined)
+            ? statusDetail.replace('Uploading...', `Uploading ${uploadProgress}%`)
             : statusDetail;
     }
     return (
@@ -89,7 +89,7 @@ const FileListItem: React.FC<FileListItemProps> = ({ queueFile, onTranscriptUpda
       </div>
       {status === TranscriptionStatus.TRANSCRIBING && (
         <div className="w-full bg-slate-700 h-1">
-          {statusDetail === 'Uploading...' && uploadProgress !== undefined ? (
+          {statusDetail?.includes('Uploading') && uploadProgress !== undefined ? (
             <div
               className="bg-blue-500 h-1 transition-all duration-300 ease-out"
               style={{ width: `${uploadProgress}%` }}

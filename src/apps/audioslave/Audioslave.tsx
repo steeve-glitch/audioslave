@@ -132,6 +132,78 @@ const stripSrt = (srt: string): string => {
     return text.split('\n').filter(line => line.trim() !== '').join('\n');
 };
 
+// --- Audio chunking for files > 2 GB ---
+
+const CHUNK_DURATION_S = 20 * 60; // 20 minutes per chunk
+
+// Adjust every timestamp in an SRT string by a fixed offset (seconds)
+const parseSrtTime = (t: string): number => {
+    const [hms, ms] = t.split(',');
+    const [h, m, s] = hms.split(':').map(Number);
+    return h * 3600 + m * 60 + s + Number(ms) / 1000;
+};
+const formatSrtTime = (total: number): string => {
+    const ms  = Math.round((total % 1) * 1000);
+    const sec = Math.floor(total);
+    const s   = sec % 60;
+    const m   = Math.floor(sec / 60) % 60;
+    const h   = Math.floor(sec / 3600);
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(ms).padStart(3,'0')}`;
+};
+const offsetSrt = (srt: string, offsetSec: number): string =>
+    srt.replace(
+        /(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})/g,
+        (_, a, b) => `${formatSrtTime(parseSrtTime(a) + offsetSec)} --> ${formatSrtTime(parseSrtTime(b) + offsetSec)}`,
+    );
+
+// Concatenate multiple SRT strings, renumbering all sequence numbers
+const mergeSrts = (srts: string[]): string => {
+    let counter = 1;
+    return srts
+        .flatMap(srt =>
+            srt.split('\n\n')
+               .filter(b => b.trim())
+               .map(block => {
+                   const lines = block.trim().split('\n');
+                   lines[0] = String(counter++);
+                   return lines.join('\n');
+               }),
+        )
+        .join('\n\n');
+};
+
+// Encode a slice of a decoded AudioBuffer as 16-bit PCM WAV
+const encodeWav = (buffer: AudioBuffer, startSample: number, endSample: number): Blob => {
+    const numCh      = buffer.numberOfChannels;
+    const sr         = buffer.sampleRate;
+    const numSamples = endSample - startSample;
+    const dataBytes  = numSamples * numCh * 2; // 16-bit = 2 bytes
+    const ab         = new ArrayBuffer(44 + dataBytes);
+    const v          = new DataView(ab);
+    const str = (off: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+
+    str(0, 'RIFF'); v.setUint32(4,  36 + dataBytes, true);
+    str(8, 'WAVE'); str(12, 'fmt ');
+    v.setUint32(16, 16, true);               // chunk size
+    v.setUint16(20, 1,  true);               // PCM
+    v.setUint16(22, numCh, true);
+    v.setUint32(24, sr, true);
+    v.setUint32(28, sr * numCh * 2, true);   // byte rate
+    v.setUint16(32, numCh * 2, true);        // block align
+    v.setUint16(34, 16, true);               // bits per sample
+    str(36, 'data'); v.setUint32(40, dataBytes, true);
+
+    let off = 44;
+    for (let i = startSample; i < endSample; i++) {
+        for (let ch = 0; ch < numCh; ch++) {
+            const s = Math.max(-1, Math.min(1, buffer.getChannelData(ch)[i]));
+            v.setInt16(off, s < 0 ? s * 32768 : s * 32767, true);
+            off += 2;
+        }
+    }
+    return new Blob([ab], { type: 'audio/wav' });
+};
+
 const transcribeAudio = async (
     ai: GoogleGenAI,
     apiKey: string,
@@ -160,6 +232,62 @@ const transcribeAudio = async (
         const textPrompt = enableDiarization
             ? "Transcribe this audio. Return a JSON array of subtitle segments. Each segment must have 'start', 'end' (in HH:MM:SS,mmm format), and 'text' fields. Enable speaker diarization and include speaker labels (e.g., [Speaker 1]) in the 'text' field. Keep segments short (max 2 lines, ~40 chars/line) for better readability."
             : "Transcribe this audio. Return a JSON array of subtitle segments. Each segment must have 'start', 'end' (in HH:MM:SS,mmm format), and 'text' fields. Keep segments short (max 2 lines, ~40 chars/line) for better readability.";
+
+        // Helper: upload a WAV chunk blob, poll until active, transcribe, return offset-adjusted SRT
+        const transcribeChunk = async (blob: Blob, chunkName: string, offsetSec: number, label: string): Promise<string> => {
+            const chunkFile = new File([blob], chunkName, { type: 'audio/wav' });
+            onStatus(`${label}: Uploading...`);
+            onUploadProgress(0);
+            const { name } = await uploadFileWithProgress(apiKey, chunkFile, 'audio/wav', onUploadProgress);
+            onStatus(`${label}: Processing...`);
+            let info = await ai.files.get({ name });
+            while (info.state === FileState.PROCESSING) {
+                await new Promise(r => setTimeout(r, 3000));
+                info = await ai.files.get({ name });
+            }
+            if (info.state !== FileState.ACTIVE) throw new Error(`${label} processing failed (state: ${info.state}).`);
+            onStatus(`${label}: Transcribing...`);
+            const resp = await ai.models.generateContent({
+                model,
+                contents: { parts: [{ fileData: { fileUri: info.uri, mimeType: info.mimeType } }, { text: textPrompt }] },
+                config: { responseMimeType: 'application/json', responseSchema: schema },
+            } as any);
+            ai.files.delete({ name }).catch(() => {});
+            if (!resp.text) return '';
+            try { return offsetSrt(jsonToSrt(JSON.parse(resp.text)), offsetSec); }
+            catch { return ''; }
+        };
+
+        // Oversized path — decode audio, split into 20-min WAV chunks, transcribe each
+        if (file.size > MAX_FILE_SIZE) {
+            onStatus('Decoding audio...');
+            let decoded: AudioBuffer;
+            try {
+                const audioCtx = new AudioContext();
+                decoded = await audioCtx.decodeAudioData(await file.arrayBuffer());
+                await audioCtx.close();
+            } catch (e) {
+                throw new Error(
+                    `Could not decode audio for splitting. Try converting the file to MP3/MP4 first. (${e instanceof Error ? e.message : e})`,
+                );
+            }
+
+            const samplesPerChunk = Math.floor(CHUNK_DURATION_S * decoded.sampleRate);
+            const numChunks       = Math.ceil(decoded.length / samplesPerChunk);
+            const chunkSrts: string[] = [];
+
+            for (let i = 0; i < numChunks; i++) {
+                const start     = i * samplesPerChunk;
+                const end       = Math.min(start + samplesPerChunk, decoded.length);
+                const offsetSec = start / decoded.sampleRate;
+                const wav       = encodeWav(decoded, start, end);
+                const chunkSrt  = await transcribeChunk(
+                    wav, `${file.name}_chunk${i + 1}.wav`, offsetSec, `Chunk ${i + 1}/${numChunks}`,
+                );
+                if (chunkSrt) chunkSrts.push(chunkSrt);
+            }
+            return { success: true, transcript: mergeSrts(chunkSrts) };
+        }
 
         let mediaPart: object;
         let uploadedFileName: string | undefined;
@@ -253,8 +381,8 @@ const Audioslave: React.FC = () => {
                 const mb = (file.size / (1024 * 1024)).toFixed(0);
                 const gb = (file.size / (1024 * 1024 * 1024)).toFixed(2);
                 if (file.size > MAX_FILE_SIZE) {
-                    warning = `File is ${gb} GB, which exceeds the 2 GB Gemini Files API limit. It will not be transcribed.`;
-                    warningLevel = 'error';
+                    warning = `Large file (${gb} GB) — will be decoded and split into ~20-minute audio chunks for transcription. Requires ~${Math.ceil(file.size / (1024 ** 3) * 1.5)} GB of free RAM.`;
+                    warningLevel = 'info';
                 } else if (file.size > INLINE_THRESHOLD) {
                     warning = `Large file (${mb} MB) — will be uploaded to Gemini file storage first. This may take several minutes.`;
                     warningLevel = 'info';
@@ -310,13 +438,7 @@ const Audioslave: React.FC = () => {
             }
         }
 
-        const waitingFiles = queue.filter(qf => qf.status === TranscriptionStatus.WAITING);
-
-        // Immediately fail files that exceed the hard size limit
-        const oversized = waitingFiles.filter(qf => qf.warningLevel === 'error');
-        oversized.forEach(qf => updateFileInQueue(qf.id, { status: TranscriptionStatus.ERROR, error: qf.warning }));
-
-        const filesToTranscribe = waitingFiles.filter(qf => qf.warningLevel !== 'error');
+        const filesToTranscribe = queue.filter(qf => qf.status === TranscriptionStatus.WAITING);
         const total = filesToTranscribe.length;
         if (total === 0) {
             setIsTranscribing(false);
