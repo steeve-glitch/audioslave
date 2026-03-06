@@ -136,6 +136,103 @@ const stripSrt = (srt: string): string => {
 
 const CHUNK_DURATION_S = 20 * 60; // 20 minutes per chunk
 
+// ADTS sampling frequency table (ISO 14496-3 Table 1.18)
+const ADTS_SAMPLE_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+
+// Parse the first 2 bytes of an AudioSpecificConfig to recover AAC parameters
+const parseAsc = (data: Uint8Array) => {
+    const v = (data[0] << 8) | data[1];
+    return {
+        profile:       (v >> 11) & 0x1F, // audioObjectType
+        samplingIndex: (v >>  7) & 0x0F,
+        channelConfig: (v >>  3) & 0x0F,
+    };
+};
+
+// Prepend a 7-byte ADTS header to every raw AAC frame and concatenate
+const buildAdts = (frames: Uint8Array[], profile: number, samplingIndex: number, channelConfig: number): ArrayBuffer => {
+    const adtsProfile = (profile - 1) & 0x3; // ADTS stores objectType−1
+    const totalBytes = frames.reduce((s, f) => s + 7 + f.byteLength, 0);
+    const out = new Uint8Array(totalBytes);
+    let off = 0;
+    for (const f of frames) {
+        const len = 7 + f.byteLength;
+        out[off]   = 0xFF;
+        out[off+1] = 0xF1; // MPEG-4, Layer 00, no CRC
+        out[off+2] = (adtsProfile << 6) | (samplingIndex << 2) | ((channelConfig >> 2) & 0x1);
+        out[off+3] = ((channelConfig & 0x3) << 6) | ((len >> 11) & 0x3);
+        out[off+4] = (len >> 3) & 0xFF;
+        out[off+5] = ((len & 0x7) << 5) | 0x1F;
+        out[off+6] = 0xFC;
+        out.set(f, off + 7);
+        off += len;
+    }
+    return out.buffer;
+};
+
+// Stream an MP4 through mp4box.js in 8 MB chunks, pull out every audio frame,
+// and return them wrapped in ADTS — small enough for AudioContext.decodeAudioData
+const extractAdtsFromMP4 = (file: File, onStatus: (s: string) => void): Promise<ArrayBuffer> =>
+    new Promise(async (resolve, reject) => {
+        try {
+            const { default: MP4Box } = await import('mp4box');
+            const mp4 = MP4Box.createFile();
+            const frames: Uint8Array[] = [];
+            let adtsParams: { profile: number; samplingIndex: number; channelConfig: number } | null = null;
+            let audioTrackId: number | null = null;
+
+            mp4.onReady = (info: any) => {
+                const track = info.audioTracks?.[0];
+                if (!track) { reject(new Error('No audio track found in this MP4.')); return; }
+                audioTrackId = track.id;
+
+                // Try to read AudioSpecificConfig from the esds box
+                try {
+                    const trak = mp4.getTrackById(track.id);
+                    const ascRaw: unknown =
+                        trak?.mdia?.minf?.stbl?.stsd?.entries?.[0]?.esds?.esd?.descs?.[0]?.descs?.[0]?.data;
+                    if (ascRaw instanceof Uint8Array && ascRaw.length >= 2) {
+                        adtsParams = parseAsc(ascRaw);
+                    }
+                } catch { /* will use fallback */ }
+
+                // Fallback: derive from track metadata
+                if (!adtsParams) {
+                    const sfIdx = ADTS_SAMPLE_RATES.indexOf(track.audio.sample_rate);
+                    adtsParams = { profile: 2, samplingIndex: sfIdx >= 0 ? sfIdx : 3, channelConfig: track.audio.channel_count };
+                }
+
+                mp4.setExtractionOptions(audioTrackId, {}, { nbSamples: 10000 });
+                mp4.start();
+            };
+
+            mp4.onSamples = (_id: number, _user: unknown, samples: any[]) => {
+                for (const s of samples) frames.push(new Uint8Array(s.data));
+            };
+
+            mp4.onFlush = () => {
+                if (!adtsParams) { reject(new Error('Could not read audio configuration from MP4.')); return; }
+                try { resolve(buildAdts(frames, adtsParams.profile, adtsParams.samplingIndex, adtsParams.channelConfig)); }
+                catch (e) { reject(e); }
+            };
+
+            mp4.onError = (e: string) => reject(new Error(`MP4 parse error: ${e}`));
+
+            // Feed the file to mp4box in 8 MB slices — never loads the full file at once
+            const CHUNK = 8 * 1024 * 1024;
+            for (let start = 0; start < file.size; start += CHUNK) {
+                const pct = Math.round((start / file.size) * 100);
+                onStatus(`Extracting audio ${pct}%...`);
+                const buf = await file.slice(start, Math.min(start + CHUNK, file.size)).arrayBuffer() as any;
+                buf.fileStart = start;
+                mp4.appendBuffer(buf);
+            }
+            mp4.flush();
+        } catch (e) {
+            reject(e);
+        }
+    });
+
 // Adjust every timestamp in an SRT string by a fixed offset (seconds)
 const parseSrtTime = (t: string): number => {
     const [hms, ms] = t.split(',');
@@ -258,17 +355,18 @@ const transcribeAudio = async (
             catch { return ''; }
         };
 
-        // Oversized path — decode audio, split into 20-min WAV chunks, transcribe each
+        // Oversized path — demux MP4, decode audio-only ADTS, split into 20-min WAV chunks
         if (file.size > MAX_FILE_SIZE) {
-            onStatus('Decoding audio...');
             let decoded: AudioBuffer;
             try {
+                const adtsBuffer = await extractAdtsFromMP4(file, onStatus);
+                onStatus('Decoding audio...');
                 const audioCtx = new AudioContext();
-                decoded = await audioCtx.decodeAudioData(await file.arrayBuffer());
+                decoded = await audioCtx.decodeAudioData(adtsBuffer);
                 await audioCtx.close();
             } catch (e) {
                 throw new Error(
-                    `Could not decode audio for splitting. Try converting the file to MP3/MP4 first. (${e instanceof Error ? e.message : e})`,
+                    `Could not extract/decode audio: ${e instanceof Error ? e.message : e}`,
                 );
             }
 
