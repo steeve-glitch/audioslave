@@ -22,12 +22,18 @@ const STATUS_CONFIG: Record<Partial<TranscriptionStatus>, StatusConfig> = {
     [TranscriptionStatus.ERROR]: { text: "Error", icon: <ErrorIcon />, color: "text-red-400" },
 }
 
-const StatusIndicator: React.FC<{ status: TranscriptionStatus }> = ({ status }) => {
+const StatusIndicator: React.FC<{ status: TranscriptionStatus; statusDetail?: string; uploadProgress?: number }> = ({ status, statusDetail, uploadProgress }) => {
     const config = STATUS_CONFIG[status] || STATUS_CONFIG[TranscriptionStatus.ERROR];
+    let label = config.text;
+    if (status === TranscriptionStatus.TRANSCRIBING && statusDetail) {
+        label = (statusDetail === 'Uploading...' && uploadProgress !== undefined)
+            ? `Uploading ${uploadProgress}%`
+            : statusDetail;
+    }
     return (
       <div className={`flex items-center gap-2 ${config.color}`}>
         {config.icon}
-        <span className="hidden sm:inline">{config.text}</span>
+        <span className="hidden sm:inline">{label}</span>
       </div>
     );
 };
@@ -37,7 +43,7 @@ const FileListItem: React.FC<FileListItemProps> = ({ queueFile, onTranscriptUpda
   const [isEditing, setIsEditing] = useState(false);
   const [editedTranscript, setEditedTranscript] = useState(queueFile.transcript || '');
 
-  const { file, status, transcript, error } = queueFile;
+  const { file, status, statusDetail, uploadProgress, warning, warningLevel, transcript, error } = queueFile;
 
   useEffect(() => {
     setEditedTranscript(transcript || '');
@@ -67,7 +73,7 @@ const FileListItem: React.FC<FileListItemProps> = ({ queueFile, onTranscriptUpda
           <p className="text-slate-500 text-sm">{formatFileSize(file.size)}</p>
         </div>
         <div className="flex-shrink-0 w-40 text-right">
-          <StatusIndicator status={status} />
+          <StatusIndicator status={status} statusDetail={statusDetail} uploadProgress={uploadProgress} />
         </div>
         <div className="flex-shrink-0 ml-4">
           {isExpandable && (
@@ -83,7 +89,24 @@ const FileListItem: React.FC<FileListItemProps> = ({ queueFile, onTranscriptUpda
       </div>
       {status === TranscriptionStatus.TRANSCRIBING && (
         <div className="w-full bg-slate-700 h-1">
-          <div className="bg-blue-500 h-1 animate-pulse" style={{ width: '100%' }}></div>
+          {statusDetail === 'Uploading...' && uploadProgress !== undefined ? (
+            <div
+              className="bg-blue-500 h-1 transition-all duration-300 ease-out"
+              style={{ width: `${uploadProgress}%` }}
+            />
+          ) : (
+            <div className="bg-blue-500 h-1 animate-pulse" style={{ width: '100%' }} />
+          )}
+        </div>
+      )}
+      {warning && status === TranscriptionStatus.WAITING && (
+        <div className={`mx-4 mb-3 px-3 py-2 rounded-md text-sm flex items-start gap-2 ${
+            warningLevel === 'error'
+                ? 'bg-red-900/30 text-red-300 border border-red-700/40'
+                : 'bg-amber-900/20 text-amber-300 border border-amber-700/40'
+        }`}>
+          <span className="mt-0.5 flex-shrink-0">{warningLevel === 'error' ? '⚠' : 'ℹ'}</span>
+          <span>{warning}</span>
         </div>
       )}
       {isExpanded && (transcript || error) && (

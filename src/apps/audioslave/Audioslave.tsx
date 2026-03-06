@@ -1,5 +1,5 @@
-import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import { GoogleGenAI } from "@google/genai";
+import React, { useState, useMemo, useRef, useCallback } from 'react';
+import { GoogleGenAI, FileState } from "@google/genai";
 import JSZip from "jszip";
 import { QueueFile, TranscriptionStatus } from './types';
 import FileUploader from './components/FileUploader';
@@ -10,6 +10,83 @@ import ExportControls from './components/ExportControls';
 import { ClearIcon, TranscribeIcon } from './components/icons';
 
 // --- Transcription Logic ---
+
+const INLINE_THRESHOLD = 15 * 1024 * 1024;   // 15 MB — above this, use Files API
+const MAX_FILE_SIZE    = 2 * 1024 * 1024 * 1024; // 2 GB — hard Gemini Files API limit
+
+const fileToBase64 = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = () => resolve((reader.result as string).split(',')[1]);
+        reader.onerror = (error) => reject(error);
+    });
+
+const getMimeType = (file: File): string => {
+    if (file.type) return file.type;
+    if (file.name.toLowerCase().endsWith('.mkv')) return 'video/x-matroska';
+    return 'application/octet-stream';
+};
+
+// --- Resumable upload with XHR progress events ---
+interface UploadedFileInfo { name: string; uri: string; mimeType: string; }
+
+const uploadFileWithProgress = (
+    apiKey: string,
+    file: File,
+    mimeType: string,
+    onProgress: (percent: number) => void,
+): Promise<UploadedFileInfo> =>
+    new Promise(async (resolve, reject) => {
+        try {
+            // Step 1: initiate a resumable upload session
+            const initRes = await fetch(
+                `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'X-Goog-Upload-Protocol': 'resumable',
+                        'X-Goog-Upload-Command': 'start',
+                        'X-Goog-Upload-Header-Content-Type': mimeType,
+                        'X-Goog-Upload-Header-Content-Length': String(file.size),
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ file: { display_name: file.name } }),
+                },
+            );
+            if (!initRes.ok) throw new Error(`Upload initiation failed: ${initRes.statusText}`);
+            const uploadUrl = initRes.headers.get('X-Goog-Upload-URL');
+            if (!uploadUrl) throw new Error('No upload URL returned by API.');
+
+            // Step 2: stream the bytes, track progress with XHR
+            const xhr = new XMLHttpRequest();
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+            };
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    try {
+                        const data = JSON.parse(xhr.responseText);
+                        const f = data.file;
+                        resolve({ name: f.name, uri: f.uri, mimeType: f.mimeType || mimeType });
+                    } catch {
+                        reject(new Error('Failed to parse upload response.'));
+                    }
+                } else {
+                    reject(new Error(`Upload failed (${xhr.status}): ${xhr.statusText}`));
+                }
+            };
+            xhr.onerror = () => reject(new Error('Upload network error.'));
+            xhr.onabort = () => reject(new Error('Upload was aborted.'));
+            xhr.open('POST', uploadUrl);
+            xhr.setRequestHeader('Content-Length', String(file.size));
+            xhr.setRequestHeader('X-Goog-Upload-Offset', '0');
+            xhr.setRequestHeader('X-Goog-Upload-Command', 'upload, finalize');
+            xhr.send(file);
+        } catch (err) {
+            reject(err);
+        }
+    });
 
 interface TranscriptionResult {
     success: boolean;
@@ -55,24 +132,17 @@ const stripSrt = (srt: string): string => {
     return text.split('\n').filter(line => line.trim() !== '').join('\n');
 };
 
-const transcribeAudio = async (worker: Worker, ai: GoogleGenAI, file: File, enableDiarization: boolean): Promise<TranscriptionResult> => {
+const transcribeAudio = async (
+    ai: GoogleGenAI,
+    apiKey: string,
+    file: File,
+    enableDiarization: boolean,
+    onStatus: (detail: string) => void,
+    onUploadProgress: (percent: number) => void,
+): Promise<TranscriptionResult> => {
     try {
         const model = "gemini-2.0-flash-exp";
-
-        const base64Data = await new Promise<string>((resolve, reject) => {
-            worker.onmessage = (event: MessageEvent<string>) => resolve(event.data);
-            worker.onerror = (error) => reject(error);
-            worker.postMessage(file);
-        });
-
-        let mimeType = file.type;
-        if (!mimeType && file.name.toLowerCase().endsWith('.mkv')) {
-            mimeType = 'video/x-matroska';
-        }
-
-        const audioPart = {
-            inlineData: { data: base64Data, mimeType },
-        };
+        const mimeType = getMimeType(file);
 
         const schema = {
             type: "ARRAY",
@@ -91,22 +161,55 @@ const transcribeAudio = async (worker: Worker, ai: GoogleGenAI, file: File, enab
             ? "Transcribe this audio. Return a JSON array of subtitle segments. Each segment must have 'start', 'end' (in HH:MM:SS,mmm format), and 'text' fields. Enable speaker diarization and include speaker labels (e.g., [Speaker 1]) in the 'text' field. Keep segments short (max 2 lines, ~40 chars/line) for better readability."
             : "Transcribe this audio. Return a JSON array of subtitle segments. Each segment must have 'start', 'end' (in HH:MM:SS,mmm format), and 'text' fields. Keep segments short (max 2 lines, ~40 chars/line) for better readability.";
 
+        let mediaPart: object;
+        let uploadedFileName: string | undefined;
+
+        if (file.size > INLINE_THRESHOLD) {
+            // Large file — resumable upload with progress, then Files API URI
+            onStatus('Uploading...');
+            const { name, uri, mimeType: fileMimeType } = await uploadFileWithProgress(
+                apiKey, file, mimeType, onUploadProgress,
+            );
+            uploadedFileName = name;
+
+            // Poll until Gemini finishes processing the file
+            onStatus('Processing...');
+            let fileInfo = await ai.files.get({ name });
+            while (fileInfo.state === FileState.PROCESSING) {
+                await new Promise(r => setTimeout(r, 3000));
+                fileInfo = await ai.files.get({ name });
+            }
+            if (fileInfo.state !== FileState.ACTIVE) {
+                throw new Error(`File processing failed on Gemini servers (state: ${fileInfo.state}).`);
+            }
+            mediaPart = { fileData: { fileUri: fileInfo.uri ?? uri, mimeType: fileInfo.mimeType ?? fileMimeType } };
+        } else {
+            // Small file — inline base64
+            onStatus('Processing...');
+            const base64Data = await fileToBase64(file);
+            mediaPart = { inlineData: { data: base64Data, mimeType } };
+        }
+
+        onStatus('Transcribing...');
         const response = await ai.models.generateContent({
             model,
-            contents: { parts: [audioPart, { text: textPrompt }] },
+            contents: { parts: [mediaPart, { text: textPrompt }] },
             config: {
                 responseMimeType: "application/json",
                 responseSchema: schema,
             }
         } as any);
 
-        const jsonText = response.text;
+        // Clean up the uploaded file from Gemini storage (best-effort)
+        if (uploadedFileName) {
+            ai.files.delete({ name: uploadedFileName }).catch(() => {});
+        }
 
+        const jsonText = response.text;
         if (jsonText) {
             try {
                 const segments = JSON.parse(jsonText);
-                const srtTranscript = jsonToSrt(segments);
-                return { success: true, transcript: srtTranscript };
+                return { success: true, transcript: jsonToSrt(segments) };
             } catch (parseError) {
                 console.error("JSON Parse Error:", parseError);
                 return { success: false, error: "Failed to parse transcription response." };
@@ -139,24 +242,31 @@ const Audioslave: React.FC = () => {
     const [jsonFilename, setJsonFilename] = useState('transcripts');
     const [globalError, setGlobalError] = useState<string | null>(null);
     const aiClientRef = useRef<GoogleGenAI | null>(null);
-    const workerRef = useRef<Worker | null>(null);
-
-    useEffect(() => {
-        workerRef.current = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
-        return () => {
-            workerRef.current?.terminate();
-        };
-    }, []);
-
+    const apiKeyRef   = useRef<string | null>(null);
 
     const handleFilesAdded = (files: File[]) => {
         const newQueueFiles: QueueFile[] = files
             .filter(file => !queue.some(qf => qf.file.name === file.name && qf.file.size === file.size))
-            .map(file => ({
-                id: `${file.name}-${file.size}-${file.lastModified}`,
-                file,
-                status: TranscriptionStatus.WAITING,
-            }));
+            .map(file => {
+                let warning: string | undefined;
+                let warningLevel: 'info' | 'error' | undefined;
+                const mb = (file.size / (1024 * 1024)).toFixed(0);
+                const gb = (file.size / (1024 * 1024 * 1024)).toFixed(2);
+                if (file.size > MAX_FILE_SIZE) {
+                    warning = `File is ${gb} GB, which exceeds the 2 GB Gemini Files API limit. It will not be transcribed.`;
+                    warningLevel = 'error';
+                } else if (file.size > INLINE_THRESHOLD) {
+                    warning = `Large file (${mb} MB) — will be uploaded to Gemini file storage first. This may take several minutes.`;
+                    warningLevel = 'info';
+                }
+                return {
+                    id: `${file.name}-${file.size}-${file.lastModified}`,
+                    file,
+                    status: TranscriptionStatus.WAITING,
+                    warning,
+                    warningLevel,
+                };
+            });
 
         if (newQueueFiles.length > 0) {
             setQueue(prev => [...prev, ...newQueueFiles]);
@@ -184,6 +294,7 @@ const Audioslave: React.FC = () => {
                 if (!apiKey) {
                     throw new Error("API key not found. Please ensure VITE_API_KEY is set in your .env file.");
                 }
+                apiKeyRef.current = apiKey;
                 aiClientRef.current = new GoogleGenAI({ apiKey });
             } catch (error: any) {
                 console.error("Failed to initialize GoogleGenAI:", error);
@@ -199,7 +310,13 @@ const Audioslave: React.FC = () => {
             }
         }
 
-        const filesToTranscribe = queue.filter(qf => qf.status === TranscriptionStatus.WAITING);
+        const waitingFiles = queue.filter(qf => qf.status === TranscriptionStatus.WAITING);
+
+        // Immediately fail files that exceed the hard size limit
+        const oversized = waitingFiles.filter(qf => qf.warningLevel === 'error');
+        oversized.forEach(qf => updateFileInQueue(qf.id, { status: TranscriptionStatus.ERROR, error: qf.warning }));
+
+        const filesToTranscribe = waitingFiles.filter(qf => qf.warningLevel !== 'error');
         const total = filesToTranscribe.length;
         if (total === 0) {
             setIsTranscribing(false);
@@ -208,27 +325,38 @@ const Audioslave: React.FC = () => {
 
         setProgressDetails({ processed: 0, total, percentage: 0 });
 
-        const transcriptionPromises = filesToTranscribe.map(async (queueFile) => {
-            updateFileInQueue(queueFile.id, { status: TranscriptionStatus.TRANSCRIBING });
-            const result = await transcribeAudio(workerRef.current!, aiClientRef.current!, queueFile.file, isSpeakerDetectionEnabled);
+        // Process files one at a time to avoid rate-limit errors and saturating upload bandwidth
+        let processed = 0;
+        for (const queueFile of filesToTranscribe) {
+            updateFileInQueue(queueFile.id, { status: TranscriptionStatus.TRANSCRIBING, statusDetail: 'Starting...' });
+            const result = await transcribeAudio(
+                aiClientRef.current!,
+                apiKeyRef.current!,
+                queueFile.file,
+                isSpeakerDetectionEnabled,
+                (detail) => updateFileInQueue(queueFile.id, { statusDetail: detail }),
+                (percent) => updateFileInQueue(queueFile.id, { uploadProgress: percent }),
+            );
 
             if (result.success) {
-                updateFileInQueue(queueFile.id, { status: TranscriptionStatus.COMPLETED, transcript: result.transcript });
+                updateFileInQueue(queueFile.id, {
+                    status: TranscriptionStatus.COMPLETED,
+                    statusDetail: undefined,
+                    uploadProgress: undefined,
+                    transcript: result.transcript,
+                });
             } else {
-                updateFileInQueue(queueFile.id, { status: TranscriptionStatus.ERROR, error: result.error });
+                updateFileInQueue(queueFile.id, {
+                    status: TranscriptionStatus.ERROR,
+                    statusDetail: undefined,
+                    uploadProgress: undefined,
+                    error: result.error,
+                });
             }
 
-            setProgressDetails(currentProgress => {
-                const processed = (currentProgress?.processed || 0) + 1;
-                return {
-                    processed,
-                    total,
-                    percentage: Math.round((processed / total) * 100),
-                };
-            });
-        });
-
-        await Promise.all(transcriptionPromises);
+            processed++;
+            setProgressDetails({ processed, total, percentage: Math.round((processed / total) * 100) });
+        }
 
         setIsTranscribing(false);
     };
