@@ -28,66 +28,6 @@ const getMimeType = (file: File): string => {
     return 'application/octet-stream';
 };
 
-// --- Resumable upload with XHR progress events ---
-interface UploadedFileInfo { name: string; uri: string; mimeType: string; }
-
-const uploadFileWithProgress = (
-    apiKey: string,
-    file: File,
-    mimeType: string,
-    onProgress: (percent: number) => void,
-): Promise<UploadedFileInfo> =>
-    new Promise(async (resolve, reject) => {
-        try {
-            // Step 1: initiate a resumable upload session
-            const initRes = await fetch(
-                `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'X-Goog-Upload-Protocol': 'resumable',
-                        'X-Goog-Upload-Command': 'start',
-                        'X-Goog-Upload-Header-Content-Type': mimeType,
-                        'X-Goog-Upload-Header-Content-Length': String(file.size),
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ file: { display_name: file.name } }),
-                },
-            );
-            if (!initRes.ok) throw new Error(`Upload initiation failed: ${initRes.statusText}`);
-            const uploadUrl = initRes.headers.get('X-Goog-Upload-URL');
-            if (!uploadUrl) throw new Error('No upload URL returned by API.');
-
-            // Step 2: stream the bytes, track progress with XHR
-            const xhr = new XMLHttpRequest();
-            xhr.upload.onprogress = (e) => {
-                if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
-            };
-            xhr.onload = () => {
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    try {
-                        const data = JSON.parse(xhr.responseText);
-                        const f = data.file;
-                        resolve({ name: f.name, uri: f.uri, mimeType: f.mimeType || mimeType });
-                    } catch {
-                        reject(new Error('Failed to parse upload response.'));
-                    }
-                } else {
-                    reject(new Error(`Upload failed (${xhr.status}): ${xhr.statusText}`));
-                }
-            };
-            xhr.onerror = () => reject(new Error('Upload network error.'));
-            xhr.onabort = () => reject(new Error('Upload was aborted.'));
-            xhr.open('POST', uploadUrl);
-            xhr.setRequestHeader('Content-Length', String(file.size));
-            xhr.setRequestHeader('X-Goog-Upload-Offset', '0');
-            xhr.setRequestHeader('X-Goog-Upload-Command', 'upload, finalize');
-            xhr.send(file);
-        } catch (err) {
-            reject(err);
-        }
-    });
-
 interface TranscriptionResult {
     success: boolean;
     transcript?: string;
@@ -170,21 +110,29 @@ const buildAdts = (frames: Uint8Array[], profile: number, samplingIndex: number,
     return out.buffer;
 };
 
-// Stream an MP4 through mp4box.js in 8 MB chunks, pull out every audio frame,
-// and return them wrapped in ADTS — small enough for AudioContext.decodeAudioData
-const extractAdtsFromMP4 = (file: File, onStatus: (s: string) => void): Promise<ArrayBuffer> =>
+// Stream an MP4 through mp4box.js in 8 MB chunks and collect audio frames with timestamps.
+// Returns frames as compressed AAC data (not yet decoded to PCM) so callers can chunk by time.
+interface AudioFrame { data: Uint8Array; dts: number; duration: number; }
+interface MP4AudioExtraction {
+    frames: AudioFrame[];
+    timescale: number;
+    adtsParams: { profile: number; samplingIndex: number; channelConfig: number };
+}
+const extractAudioFramesFromMP4 = (file: File, onStatus: (s: string) => void): Promise<MP4AudioExtraction> =>
     new Promise(async (resolve, reject) => {
         try {
-            const { default: MP4Box } = await import('mp4box');
+            const MP4Box = await import('mp4box');
             const mp4 = MP4Box.createFile();
-            const frames: Uint8Array[] = [];
+            const frames: AudioFrame[] = [];
             let adtsParams: { profile: number; samplingIndex: number; channelConfig: number } | null = null;
             let audioTrackId: number | null = null;
+            let timescale = 90000;
 
             mp4.onReady = (info: any) => {
                 const track = info.audioTracks?.[0];
                 if (!track) { reject(new Error('No audio track found in this MP4.')); return; }
                 audioTrackId = track.id;
+                timescale = track.timescale;
 
                 // Try to read AudioSpecificConfig from the esds box
                 try {
@@ -207,27 +155,33 @@ const extractAdtsFromMP4 = (file: File, onStatus: (s: string) => void): Promise<
             };
 
             mp4.onSamples = (_id: number, _user: unknown, samples: any[]) => {
-                for (const s of samples) frames.push(new Uint8Array(s.data));
-            };
-
-            mp4.onFlush = () => {
-                if (!adtsParams) { reject(new Error('Could not read audio configuration from MP4.')); return; }
-                try { resolve(buildAdts(frames, adtsParams.profile, adtsParams.samplingIndex, adtsParams.channelConfig)); }
-                catch (e) { reject(e); }
+                for (const s of samples) frames.push({ data: new Uint8Array(s.data), dts: s.dts, duration: s.duration });
             };
 
             mp4.onError = (e: string) => reject(new Error(`MP4 parse error: ${e}`));
 
-            // Feed the file to mp4box in 8 MB slices — never loads the full file at once
+            // Feed mp4box following its nextFileStart return value.
+            // For moov-at-end files (common in screen recordings), mp4box discards mdat
+            // buffers before finding the track info, then returns a seek-back offset so
+            // we re-read that data.  Following nextFileStart handles both layouts.
             const CHUNK = 8 * 1024 * 1024;
-            for (let start = 0; start < file.size; start += CHUNK) {
-                const pct = Math.round((start / file.size) * 100);
+            const MAX_ITER = Math.ceil(file.size / CHUNK) * 4 + 100;
+            let nextOffset = 0;
+            for (let iter = 0; iter < MAX_ITER && nextOffset < file.size; iter++) {
+                const end = Math.min(nextOffset + CHUNK, file.size);
+                const pct = Math.round((nextOffset / file.size) * 100);
                 onStatus(`Extracting audio ${pct}%...`);
-                const buf = await file.slice(start, Math.min(start + CHUNK, file.size)).arrayBuffer() as any;
-                buf.fileStart = start;
-                mp4.appendBuffer(buf);
+                const buf = await file.slice(nextOffset, end).arrayBuffer() as any;
+                buf.fileStart = nextOffset;
+                const returned: number | undefined = mp4.appendBuffer(buf);
+                if (returned === undefined || returned >= file.size) break;
+                nextOffset = returned;
             }
+            onStatus('Finalizing extraction...');
+            await new Promise(r => setTimeout(r, 0));
             mp4.flush();
+            if (!adtsParams) { reject(new Error('Could not read audio configuration from MP4.')); return; }
+            resolve({ frames, timescale, adtsParams });
         } catch (e) {
             reject(e);
         }
@@ -303,7 +257,7 @@ const encodeWav = (buffer: AudioBuffer, startSample: number, endSample: number):
 
 const transcribeAudio = async (
     ai: GoogleGenAI,
-    apiKey: string,
+    _apiKey: string,
     file: File,
     enableDiarization: boolean,
     onStatus: (detail: string) => void,
@@ -335,7 +289,9 @@ const transcribeAudio = async (
             const chunkFile = new File([blob], chunkName, { type: 'audio/wav' });
             onStatus(`${label}: Uploading...`);
             onUploadProgress(0);
-            const { name } = await uploadFileWithProgress(apiKey, chunkFile, 'audio/wav', onUploadProgress);
+            const uploaded = await ai.files.upload({ file: chunkFile, config: { mimeType: 'audio/wav', displayName: chunkName } });
+            onUploadProgress(100);
+            const name = uploaded.name!;
             onStatus(`${label}: Processing...`);
             let info = await ai.files.get({ name });
             while (info.state === FileState.PROCESSING) {
@@ -346,7 +302,7 @@ const transcribeAudio = async (
             onStatus(`${label}: Transcribing...`);
             const resp = await ai.models.generateContent({
                 model,
-                contents: { parts: [{ fileData: { fileUri: info.uri, mimeType: info.mimeType } }, { text: textPrompt }] },
+                contents: { parts: [{ fileData: { fileUri: info.uri!, mimeType: info.mimeType! } }, { text: textPrompt }] },
                 config: { responseMimeType: 'application/json', responseSchema: schema },
             } as any);
             ai.files.delete({ name }).catch(() => {});
@@ -355,32 +311,53 @@ const transcribeAudio = async (
             catch { return ''; }
         };
 
-        // Oversized path — demux MP4, decode audio-only ADTS, split into 20-min WAV chunks
+        // Oversized path — demux MP4, decode one 20-min chunk at a time to avoid OOM
         if (file.size > MAX_FILE_SIZE) {
-            let decoded: AudioBuffer;
+            let extraction: MP4AudioExtraction;
             try {
-                const adtsBuffer = await extractAdtsFromMP4(file, onStatus);
-                onStatus('Decoding audio...');
-                const audioCtx = new AudioContext();
-                decoded = await audioCtx.decodeAudioData(adtsBuffer);
-                await audioCtx.close();
+                extraction = await extractAudioFramesFromMP4(file, onStatus);
             } catch (e) {
                 throw new Error(
-                    `Could not extract/decode audio: ${e instanceof Error ? e.message : e}`,
+                    `Could not extract audio: ${e instanceof Error ? e.message : e}`,
                 );
             }
 
-            const samplesPerChunk = Math.floor(CHUNK_DURATION_S * decoded.sampleRate);
-            const numChunks       = Math.ceil(decoded.length / samplesPerChunk);
+            const { frames, timescale, adtsParams } = extraction;
+            if (frames.length === 0) throw new Error('No audio frames found in MP4.');
+
+            const firstDts      = frames[0].dts;
+            const lastFrame     = frames[frames.length - 1];
+            const totalDtsDur   = (lastFrame.dts + lastFrame.duration) - firstDts;
+            const chunkDts      = CHUNK_DURATION_S * timescale;
+            const numChunks     = Math.max(1, Math.ceil(totalDtsDur / chunkDts));
             const chunkSrts: string[] = [];
 
-            for (let i = 0; i < numChunks; i++) {
-                const start     = i * samplesPerChunk;
-                const end       = Math.min(start + samplesPerChunk, decoded.length);
-                const offsetSec = start / decoded.sampleRate;
-                const wav       = encodeWav(decoded, start, end);
-                const chunkSrt  = await transcribeChunk(
-                    wav, `${file.name}_chunk${i + 1}.wav`, offsetSec, `Chunk ${i + 1}/${numChunks}`,
+            let frameIdx = 0;
+            for (let c = 0; c < numChunks && frameIdx < frames.length; c++) {
+                const endDts        = c < numChunks - 1 ? firstDts + (c + 1) * chunkDts : Infinity;
+                const chunkFrames: Uint8Array[] = [];
+                const chunkOffsetSec = (frames[frameIdx].dts - firstDts) / timescale;
+
+                while (frameIdx < frames.length && frames[frameIdx].dts < endDts) {
+                    chunkFrames.push(frames[frameIdx].data);
+                    frameIdx++;
+                }
+                if (chunkFrames.length === 0) continue;
+
+                onStatus(`Decoding chunk ${c + 1}/${numChunks}...`);
+                let decoded: AudioBuffer;
+                try {
+                    const adtsBuffer = buildAdts(chunkFrames, adtsParams.profile, adtsParams.samplingIndex, adtsParams.channelConfig);
+                    const audioCtx   = new AudioContext();
+                    decoded          = await audioCtx.decodeAudioData(adtsBuffer);
+                    await audioCtx.close();
+                } catch (e) {
+                    throw new Error(`Could not decode audio chunk ${c + 1}: ${e instanceof Error ? e.message : e}`);
+                }
+
+                const wav      = encodeWav(decoded, 0, decoded.length);
+                const chunkSrt = await transcribeChunk(
+                    wav, `${file.name}_chunk${c + 1}.wav`, chunkOffsetSec, `Chunk ${c + 1}/${numChunks}`,
                 );
                 if (chunkSrt) chunkSrts.push(chunkSrt);
             }
@@ -391,11 +368,11 @@ const transcribeAudio = async (
         let uploadedFileName: string | undefined;
 
         if (file.size > INLINE_THRESHOLD) {
-            // Large file — resumable upload with progress, then Files API URI
+            // Large file — upload via SDK (avoids HTTP referrer restriction on raw fetch)
             onStatus('Uploading...');
-            const { name, uri, mimeType: fileMimeType } = await uploadFileWithProgress(
-                apiKey, file, mimeType, onUploadProgress,
-            );
+            const uploaded = await ai.files.upload({ file, config: { mimeType, displayName: file.name } });
+            onUploadProgress(100);
+            const { name, uri, mimeType: fileMimeType } = { name: uploaded.name!, uri: uploaded.uri!, mimeType: uploaded.mimeType || mimeType };
             uploadedFileName = name;
 
             // Poll until Gemini finishes processing the file
